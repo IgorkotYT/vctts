@@ -76,6 +76,8 @@ target_link_libraries(vctts PRIVATE
     uuid
     winmm
     advapi32
+    setupapi
+    newdev
     propsys
     avrt
     winhttp
@@ -121,6 +123,6 @@ if(BUILD_TESTS)
         WIN32_LEAN_AND_MEAN
         NOMINMAX
     )
-    target_link_libraries(test_driver_setup PRIVATE shell32 urlmon advapi32 propsys ole32)
+    target_link_libraries(test_driver_setup PRIVATE shell32 urlmon advapi32 setupapi newdev propsys ole32)
     add_test(NAME DriverSetupTest COMMAND test_driver_setup)
 endif()

@@ -1,5 +1,6 @@
 #include "native_ui.h"
 
+#include "audio_devices.h"
 #include "custom_tts.h"
 #include "driver_setup.h"
 #include "tts_winrt.h"
@@ -920,10 +921,26 @@ void NativeUi::activate_hit(Hit hit)
         if (MessageBoxW(hwnd_, L"Install or repair the bundled virtual audio driver? This will ask for administrator permission.",
                         L"Mic Bridge", MB_YESNO | MB_ICONQUESTION) == IDYES) {
             bool ok = driver_setup::install_or_repair(hwnd_);
-            MessageBoxW(hwnd_, ok ? L"Driver setup finished. Press Refresh devices if endpoints do not appear." :
-                                    L"Driver setup could not start or did not complete successfully.",
-                        L"Mic Bridge", ok ? MB_OK | MB_ICONINFORMATION : MB_OK | MB_ICONWARNING);
-            driver_setup::refresh_status(*state_);
+            if (ok) {
+                for (int attempt = 0; attempt < 10; ++attempt) {
+                    RefreshOutputDevices(*state_);
+                    DriverSetupStatus status = driver_setup::refresh_status(*state_);
+                    if (status.virtualPlaybackFound && status.virtualCaptureFound)
+                        break;
+                    Sleep(200);
+                }
+
+                const bool endpointsReady = state_->driverSetup.virtualPlaybackFound &&
+                                            state_->driverSetup.virtualCaptureFound;
+                MessageBoxW(hwnd_,
+                            endpointsReady
+                                ? L"Driver setup finished and the virtual audio endpoints are ready."
+                                : L"Driver setup finished, but Windows has not exposed the endpoints yet. Restart Windows or press Refresh devices.",
+                            L"Mic Bridge",
+                            endpointsReady ? MB_OK | MB_ICONINFORMATION : MB_OK | MB_ICONWARNING);
+            } else {
+                driver_setup::refresh_status(*state_);
+            }
         }
         break;
     case Hit::SetDefaultMic:
