@@ -134,8 +134,11 @@ static bool MainMsgHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam, LR
 }
 
 
-int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int)
+int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR commandLine, int)
 {
+    if (commandLine && lstrcmpW(commandLine, driver_setup::kElevatedInstallArgument) == 0)
+        return static_cast<int>(driver_setup::install_driver_elevated());
+
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
     AppState state;

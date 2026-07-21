@@ -23,7 +23,8 @@ Designed for games and voice chat where you need **fast TTS** without touching y
 
 ## Requirements
 
-- **Windows 10 / 11**
+- **Windows 10 / 11** for the core TTS overlay
+- **Windows 11 x64 (build 22000+)** for the bundled signed virtual audio driver
 - **Visual Studio 2022** or newer (Desktop C++ workload)
 - **CMake 3.20+**
 - A C++20-compatible compiler (MSVC or clang-cl)
@@ -40,6 +41,10 @@ miniaudio/
 ```
 
 No external downloads or package managers required.
+
+The **Install/Repair Driver** button creates the virtual audio device and installs
+the bundled driver with administrator permission. The upstream signed package does
+not support Windows 10 or ARM64; use a compatible third-party virtual cable there.
 
 ---
 

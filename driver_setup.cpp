@@ -5,8 +5,10 @@
 #include <mmdeviceapi.h>
 #include <mmreg.h>
 #include <functiondiscoverykeys_devpkey.h>
+#include <newdev.h>
 #include <propvarutil.h>
 #include <propsys.h>
+#include <setupapi.h>
 #include <urlmon.h>
 #include <wincrypt.h>
 
@@ -50,10 +52,12 @@ namespace
         L"DD10560994DE65A7E587FB8B93C0D7E9838292D9C3566A0976C2786D727292BD";
     constexpr const wchar_t* kDriverInfRelative =
         L"25.7.14\\Virtual Audio Driver\\VirtualAudioDriver.inf";
+    constexpr const wchar_t* kDefaultDriverHardwareId = L"ROOT\\VirtualAudioDriver";
     constexpr const wchar_t* kManifestText =
         L"# Downloaded by vctts from VirtualDrivers/Virtual-Audio-Driver.\r\n"
         L"version=25.7.14\r\n"
         L"inf=25.7.14\\Virtual Audio Driver\\VirtualAudioDriver.inf\r\n"
+        L"hardware_id=ROOT\\VirtualAudioDriver\r\n"
         L"playback_matches=Virtual Audio Driver by MTT|Virtual Audio|Virtual Speaker|Cable Input|Voicemeeter Input\r\n"
         L"capture_matches=Virtual Mic Driver by MTT|Virtual Mic|Virtual Microphone|Cable Output|Voicemeeter Output\r\n";
 
@@ -86,12 +90,18 @@ namespace
         return out;
     }
 
-    std::filesystem::path app_dir()
+    std::filesystem::path executable_path()
     {
         wchar_t path[MAX_PATH]{};
-        GetModuleFileNameW(nullptr, path, (DWORD)std::size(path));
-        std::filesystem::path exe(path);
-        return exe.parent_path();
+        DWORD length = GetModuleFileNameW(nullptr, path, (DWORD)std::size(path));
+        if (length == 0 || length >= std::size(path))
+            return {};
+        return std::filesystem::path(path);
+    }
+
+    std::filesystem::path app_dir()
+    {
+        return executable_path().parent_path();
     }
 
     std::filesystem::path manifest_path()
@@ -166,6 +176,110 @@ namespace
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
         return code == 0;
+    }
+
+    bool hardware_id_list_contains(const wchar_t* ids, size_t charCount, const std::wstring& wanted)
+    {
+        if (!ids || wanted.empty())
+            return false;
+
+        size_t offset = 0;
+        while (offset < charCount && ids[offset] != L'\0') {
+            size_t remaining = charCount - offset;
+            size_t length = wcsnlen_s(ids + offset, remaining);
+            if (length == remaining)
+                return false;
+            if (_wcsicmp(ids + offset, wanted.c_str()) == 0)
+                return true;
+            offset += length + 1;
+        }
+        return false;
+    }
+
+    DWORD find_existing_device(const GUID& classGuid, const std::wstring& hardwareId, bool& found)
+    {
+        found = false;
+        HDEVINFO devices = SetupDiGetClassDevsW(&classGuid, nullptr, nullptr, 0);
+        if (devices == INVALID_HANDLE_VALUE)
+            return GetLastError();
+
+        DWORD result = ERROR_SUCCESS;
+        for (DWORD index = 0; ; ++index) {
+            SP_DEVINFO_DATA device{};
+            device.cbSize = sizeof(device);
+            if (!SetupDiEnumDeviceInfo(devices, index, &device)) {
+                DWORD error = GetLastError();
+                if (error != ERROR_NO_MORE_ITEMS)
+                    result = error;
+                break;
+            }
+
+            DWORD type = 0;
+            DWORD required = 0;
+            SetupDiGetDeviceRegistryPropertyW(devices, &device, SPDRP_HARDWAREID,
+                                              &type, nullptr, 0, &required);
+            if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || required == 0)
+                continue;
+
+            std::vector<BYTE> value(required + sizeof(wchar_t), 0);
+            if (!SetupDiGetDeviceRegistryPropertyW(devices, &device, SPDRP_HARDWAREID,
+                                                   &type, value.data(), required, nullptr))
+                continue;
+            if (type != REG_SZ && type != REG_MULTI_SZ)
+                continue;
+
+            if (hardware_id_list_contains(reinterpret_cast<const wchar_t*>(value.data()),
+                                          value.size() / sizeof(wchar_t), hardwareId)) {
+                found = true;
+                break;
+            }
+        }
+
+        SetupDiDestroyDeviceInfoList(devices);
+        return result;
+    }
+
+    DWORD create_root_device(const GUID& classGuid,
+                             const wchar_t* className,
+                             const std::wstring& hardwareId,
+                             HDEVINFO& deviceSet,
+                             SP_DEVINFO_DATA& device)
+    {
+        deviceSet = SetupDiCreateDeviceInfoList(&classGuid, nullptr);
+        if (deviceSet == INVALID_HANDLE_VALUE)
+            return GetLastError();
+
+        device = {};
+        device.cbSize = sizeof(device);
+        if (!SetupDiCreateDeviceInfoW(deviceSet, className, &classGuid, nullptr, nullptr,
+                                      DICD_GENERATE_ID, &device)) {
+            DWORD error = GetLastError();
+            SetupDiDestroyDeviceInfoList(deviceSet);
+            deviceSet = INVALID_HANDLE_VALUE;
+            return error;
+        }
+
+        std::vector<wchar_t> hardwareIds(hardwareId.begin(), hardwareId.end());
+        hardwareIds.push_back(L'\0');
+        hardwareIds.push_back(L'\0');
+        const DWORD hardwareIdsBytes = static_cast<DWORD>(hardwareIds.size() * sizeof(wchar_t));
+        if (!SetupDiSetDeviceRegistryPropertyW(deviceSet, &device, SPDRP_HARDWAREID,
+                                               reinterpret_cast<const BYTE*>(hardwareIds.data()),
+                                               hardwareIdsBytes)) {
+            DWORD error = GetLastError();
+            SetupDiDestroyDeviceInfoList(deviceSet);
+            deviceSet = INVALID_HANDLE_VALUE;
+            return error;
+        }
+
+        if (!SetupDiCallClassInstaller(DIF_REGISTERDEVICE, deviceSet, &device)) {
+            DWORD error = GetLastError();
+            SetupDiDestroyDeviceInfoList(deviceSet);
+            deviceSet = INVALID_HANDLE_VALUE;
+            return error;
+        }
+
+        return ERROR_SUCCESS;
     }
 
     std::wstring bytes_to_hex(const BYTE* bytes, DWORD count)
@@ -264,6 +378,7 @@ namespace driver_setup
             std::wstring value = trim(line.substr(eq + 1));
             if (key == L"version") manifest.version = value;
             else if (key == L"inf") manifest.infPath = value;
+            else if (key == L"hardware_id") manifest.hardwareId = value;
             else if (key == L"playback_matches") manifest.playbackMatches = split_list(value);
             else if (key == L"capture_matches") manifest.captureMatches = split_list(value);
         }
@@ -285,11 +400,24 @@ namespace driver_setup
 
     int find_matching_device(const std::vector<AudioDevice>& devices, const std::vector<std::wstring>& matches)
     {
-        for (int i = 0; i < (int)devices.size(); ++i) {
-            std::wstring name = lower(devices[i].name);
-            for (const std::wstring& match : matches) {
-                std::wstring needle = lower(match);
-                if (!needle.empty() && name.find(needle) != std::wstring::npos)
+        // Prefer the manifest's match order and exact endpoint names. Otherwise an
+        // unrelated cable listed first by Windows can beat the bundled MTT driver.
+        for (const std::wstring& match : matches) {
+            std::wstring needle = lower(match);
+            if (needle.empty())
+                continue;
+            for (int i = 0; i < (int)devices.size(); ++i) {
+                if (lower(devices[i].name) == needle)
+                    return i;
+            }
+        }
+
+        for (const std::wstring& match : matches) {
+            std::wstring needle = lower(match);
+            if (needle.empty())
+                continue;
+            for (int i = 0; i < (int)devices.size(); ++i) {
+                if (lower(devices[i].name).find(needle) != std::wstring::npos)
                     return i;
             }
         }
@@ -370,7 +498,13 @@ namespace driver_setup
             return false;
         }
 
-        write_default_manifest();
+        if (!write_default_manifest()) {
+            MessageBoxW(owner,
+                        L"The driver was extracted, but its manifest could not be written.",
+                        L"Mic Bridge Driver",
+                        MB_OK | MB_ICONERROR);
+            return false;
+        }
 
         int install = MessageBoxW(
             owner,
@@ -393,23 +527,110 @@ namespace driver_setup
         if (!std::filesystem::exists(inf))
             return false;
 
-        std::wstring params = L"/add-driver \"" + inf.wstring() + L"\" /install";
+        std::filesystem::path exe = executable_path();
+        if (exe.empty())
+            return false;
+
+        std::wstring exeString = exe.wstring();
+        std::wstring directoryString = app_dir().wstring();
         SHELLEXECUTEINFOW sei{};
         sei.cbSize = sizeof(sei);
         sei.fMask = SEE_MASK_NOCLOSEPROCESS;
         sei.hwnd = owner;
         sei.lpVerb = L"runas";
-        sei.lpFile = L"pnputil.exe";
-        sei.lpParameters = params.c_str();
+        sei.lpFile = exeString.c_str();
+        sei.lpParameters = kElevatedInstallArgument;
+        sei.lpDirectory = directoryString.c_str();
         sei.nShow = SW_HIDE;
-        if (!ShellExecuteExW(&sei))
+        if (!ShellExecuteExW(&sei)) {
+            DWORD error = GetLastError();
+            if (error != ERROR_CANCELLED) {
+                std::wstring message = L"Could not start the administrator installer (Windows error " +
+                                       std::to_wstring(error) + L").";
+                MessageBoxW(owner, message.c_str(), L"Mic Bridge Driver", MB_OK | MB_ICONERROR);
+            }
             return false;
+        }
 
-        WaitForSingleObject(sei.hProcess, INFINITE);
+        if (WaitForSingleObject(sei.hProcess, INFINITE) != WAIT_OBJECT_0) {
+            CloseHandle(sei.hProcess);
+            return false;
+        }
+
         DWORD code = 1;
         GetExitCodeProcess(sei.hProcess, &code);
         CloseHandle(sei.hProcess);
-        return code == 0;
+
+        if (code == ERROR_SUCCESS_REBOOT_REQUIRED) {
+            MessageBoxW(owner,
+                        L"The virtual audio driver was installed. Restart Windows to finish setup.",
+                        L"Mic Bridge Driver",
+                        MB_OK | MB_ICONINFORMATION);
+        } else if (!is_successful_install_exit_code(code)) {
+            std::wstring message = L"Windows could not install the virtual audio device (error " +
+                                   std::to_wstring(code) +
+                                   L").\n\nDetails are recorded in C:\\Windows\\INF\\setupapi.dev.log.";
+            MessageBoxW(owner, message.c_str(), L"Mic Bridge Driver", MB_OK | MB_ICONERROR);
+        }
+        return is_successful_install_exit_code(code);
+    }
+
+    bool is_successful_install_exit_code(DWORD code)
+    {
+        return code == ERROR_SUCCESS ||
+               code == ERROR_SUCCESS_REBOOT_REQUIRED ||
+               code == ERROR_SUCCESS_REBOOT_INITIATED;
+    }
+
+    DWORD install_driver_elevated()
+    {
+        Manifest manifest;
+        if (!load_manifest(manifest))
+            return ERROR_FILE_NOT_FOUND;
+
+        const std::filesystem::path inf = resolve_inf_path(manifest);
+        std::error_code fileError;
+        if (!std::filesystem::is_regular_file(inf, fileError))
+            return fileError ? static_cast<DWORD>(fileError.value()) : ERROR_FILE_NOT_FOUND;
+
+        const std::wstring hardwareId = manifest.hardwareId.empty()
+            ? std::wstring(kDefaultDriverHardwareId)
+            : manifest.hardwareId;
+
+        GUID classGuid{};
+        wchar_t className[256]{};
+        if (!SetupDiGetINFClassW(inf.c_str(), &classGuid, className,
+                                 static_cast<DWORD>(std::size(className)), nullptr))
+            return GetLastError();
+
+        bool deviceExists = false;
+        DWORD result = find_existing_device(classGuid, hardwareId, deviceExists);
+        if (result != ERROR_SUCCESS)
+            return result;
+
+        HDEVINFO createdDeviceSet = INVALID_HANDLE_VALUE;
+        SP_DEVINFO_DATA createdDevice{};
+        if (!deviceExists) {
+            result = create_root_device(classGuid, className, hardwareId,
+                                        createdDeviceSet, createdDevice);
+            if (result != ERROR_SUCCESS)
+                return result;
+        }
+
+        BOOL rebootRequired = FALSE;
+        if (!UpdateDriverForPlugAndPlayDevicesW(nullptr, hardwareId.c_str(), inf.c_str(),
+                                                INSTALLFLAG_FORCE, &rebootRequired)) {
+            result = GetLastError();
+            if (createdDeviceSet != INVALID_HANDLE_VALUE)
+                SetupDiCallClassInstaller(DIF_REMOVE, createdDeviceSet, &createdDevice);
+        }
+
+        if (createdDeviceSet != INVALID_HANDLE_VALUE)
+            SetupDiDestroyDeviceInfoList(createdDeviceSet);
+
+        if (result != ERROR_SUCCESS)
+            return result;
+        return rebootRequired ? ERROR_SUCCESS_REBOOT_REQUIRED : ERROR_SUCCESS;
     }
 
     bool set_default_communications_capture(const AppState& state, HWND owner)
